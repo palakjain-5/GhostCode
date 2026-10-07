@@ -1,0 +1,5 @@
+# Streamlit configuration for GhostCode.
+# GhostCode is an offline, read-only analysis tool — disable telemetry.
+
+[browser]
+gatherUsageStats = false

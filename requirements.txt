@@ -1,3 +1,7 @@
+# Runtime dependencies for GhostCode.
+#
+# The five analysis stages (git / code / intent / drift / risk) use only the
+# Python standard library; GitPython powers the Git history analyzer and
+# Streamlit powers the dashboard (imported lazily, UI-only).
 GitPython>=3.1.40
 streamlit>=1.31
-pytest>=7.4

@@ -57,7 +57,7 @@ Repository-level scoring rolls individual findings up into a
 worst finding — the highest-score finding drives repository risk).
 
 Risk scoring does not decide what to *do* about a finding; presenting the
-results (dashboard) is a later phase.
+results is the dashboard stage's job.
 """
 
 from __future__ import annotations

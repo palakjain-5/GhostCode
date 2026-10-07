@@ -1,9 +1,9 @@
 """GhostCode — Developer Intent Drift Detection System.
 
-GhostCode is under active development. Five pipeline stages are implemented
+GhostCode is under active development. Six pipeline stages are implemented
 so far: the Git history analyzer, the Python code analyzer, intent
-extraction, intent drift detection and risk scoring. See README.md for the
-current status.
+extraction, intent drift detection, risk scoring and the Streamlit
+dashboard. See README.md for the current status.
 """
 
 from .code_analyzer import (
@@ -71,6 +71,10 @@ from .risk_scorer import (
     calculate_risk_report,
     resolve_severity,
 )
+from .dashboard import (
+    DashboardModel,
+    build_dashboard_model,
+)
 
 __version__ = "0.1.0"
 
@@ -136,4 +140,7 @@ __all__ = [
     "SENSITIVE_AREAS",
     "AREA_IMPACT",
     "DIRECT_EVIDENCE_RULES",
+    # Dashboard (phase: completed)
+    "DashboardModel",
+    "build_dashboard_model",
 ]

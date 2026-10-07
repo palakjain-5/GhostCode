@@ -39,8 +39,8 @@ How detection works (high level):
    they only produce a row when something was actually lost.
 
 Intent extraction in this phase is deterministic and heuristic. It does not
-use an LLM. It does not decide whether the drift is *risky* — risk scoring
-is a later phase.
+use an LLM. It does not decide whether the drift is *risky* — that judgment
+belongs to the risk scoring stage.
 """
 
 from __future__ import annotations

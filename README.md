@@ -8,15 +8,16 @@ code structure — and then compares that intent against the current Python
 implementation. The goal is to flag places where the code may have drifted
 away from what the developers originally intended.
 
-> ⚠️ **Project status:** GhostCode is a work in progress. **Five pipeline
+> ⚠️ **Project status:** GhostCode is a work in progress. **Six pipeline
 > stages currently exist** — the Git History Analyzer, the Python Code
-> Analyzer, Intent Extraction, Intent Drift Detection and Risk Scoring.
-> The dashboard is future work.
+> Analyzer, Intent Extraction, Intent Drift Detection, Risk Scoring and
+> the Streamlit Dashboard. Database storage, LLM integration and
+> deployment are future work.
 >
 > GhostCode extracts structural evidence from Python source code and
-> structured intent from Git history, then compares them and scores the
-> resulting drift: this phase implements deterministic, explainable risk
-> scoring.
+> structured intent from Git history, then compares them, scores the
+> resulting drift and presents everything in a dashboard: this phase
+> implements the read-only Streamlit presentation layer.
 
 ## Intended pipeline
 
@@ -32,9 +33,9 @@ Intent Extraction           ← implemented
 Intent vs Implementation    ← implemented
 Comparison + Drift Detection
       ↓
-Risk Scoring                ← implemented (this phase)
+Risk Scoring                ← implemented
       ↓
-Streamlit Dashboard         ← not yet implemented
+Streamlit Dashboard         ← implemented (this phase)
 ```
 
 ## Current development phase
@@ -45,8 +46,8 @@ Streamlit Dashboard         ← not yet implemented
 | Python Code Analyzer (AST) | ✅ implemented |
 | Intent Extraction | ✅ implemented |
 | Intent vs Implementation Comparison + Drift Detection | ✅ implemented |
-| Risk Scoring | ✅ implemented (this phase) |
-| Streamlit Dashboard | ⏳ planned |
+| Risk Scoring | ✅ implemented |
+| Streamlit Dashboard | ✅ implemented (this phase) |
 
 ## Purpose of `GitHistoryAnalyzer`
 
@@ -349,6 +350,11 @@ never consulted) is **HIGH**.
 * Pairing requires a shared changed file or a shared non-`unknown`
   category; an unrelated-looking refactor that silently breaks something
   is only caught by the safety-net check against the current state.
+* Commits are ordered by `(committed_at, hash)`; two commits made within
+  the same second are therefore ordered by hash, which is arbitrary in
+  practice. Real histories are almost always seconds/minutes apart, but
+  scripted repositories that create commits in a tight loop can exhibit
+  order-sensitive results.
 * Coverage/guard checks are name-based: renaming a behavior function
   beyond all intent markers can look like a loss, and an inline
   membership guard written without any marker keyword is invisible to the
@@ -538,6 +544,86 @@ authentication scenario.
   across many small findings (the finding counts are reported alongside
   for that context).
 
+## Dashboard
+
+The **Streamlit dashboard** is the presentation stage: a read-only web UI
+over the five analysis stages. It *consumes* the existing public APIs —
+`GitHistoryAnalyzer.analyze()`, `PythonCodeAnalyzer.analyze()`,
+`IntentExtractor.extract_all()`, `IntentDriftDetector.detect()` and
+`calculate_risk_report()` — and contains **no analysis logic of its own**,
+so the UI can never disagree with the CLI, the library or the tests.
+
+> **The dashboard is presentation only.** It is deterministic (the same
+> repository always renders the same numbers), offline (no network), and
+> strictly read-only — the analyzed repository is never modified. There is
+> no LLM, no database and no deployment machinery behind it: state lives
+> in the browser session for the duration of the run.
+
+### Running it
+
+```bash
+pip install -r requirements.txt          # now includes streamlit
+streamlit run dashboard.py
+```
+
+Optionally preselect a repository path:
+
+```bash
+GHOSTCODE_REPOSITORY=~/Projects/PayGuard streamlit run dashboard.py
+```
+
+(`python3 dashboard.py` outside Streamlit just prints this usage hint.)
+
+### What's on screen
+
+Enter a local repository path in the sidebar and click **Analyze
+repository** — the full pipeline runs once and six tabs render:
+
+| Tab | Content |
+| --- | --- |
+| **Overview** | Repository header, headline metrics (commits, files, intents, comparisons, findings, overall risk) and the pipeline status with per-stage counts |
+| **Git History** | Chronological commit table (hash, summary, author, date, files, +/−) with a per-commit detail view (full message, changed files) |
+| **Python Code** | Code totals (files, functions, classes, imports, calls, parse errors) and a per-module table; parse errors are listed, never hidden |
+| **Intents** | One row per commit — action, object, category, confidence — plus per-intent evidence |
+| **Drift** | Comparison summary (comparisons / drifted / significant), one row per pair, and per-pair detail: severity, reason, structural implementation evidence and the full comparison evidence |
+| **Risk** | Risk summary (findings, high-risk, critical, overall), one row per finding, and per-finding detail: every factor with its exact points, raw vs final score and the prose explanation |
+
+### API
+
+The view model is built by a pure function that needs no UI runtime:
+
+```python
+from ghostcode.dashboard import build_dashboard_model
+
+model = build_dashboard_model("~/Projects/PayGuard")
+if model.error:
+    print("failed:", model.error)
+else:
+    print(model.git["total_commits"], "commits")
+    print(model.risk["total_findings"], "findings,",
+          "overall", model.risk["overall_risk"])
+    payload = model.to_dict()          # plain dict, JSON-serializable
+```
+
+`DashboardModel` carries one section per stage (`git`, `code`, `intents`,
+`drift`, `risk`) plus `error` — failures never raise, they are captured
+as a readable message for the UI. `ghostcode.dashboard` imports
+Streamlit *lazily inside the view functions*, so importing the builder
+(and the package root) does not require Streamlit.
+
+### Dashboard limitations
+
+* The UI is a viewer, not an editor: no filtering, search or pagination —
+  very large histories render as one long table.
+* Analysis results are held in the session (and optionally cached by
+  Streamlit); nothing is persisted, so a refresh re-runs the pipeline.
+* One repository is analyzed per session (changing the path re-analyzes).
+* All upstream limitations apply unchanged: heuristics stay heuristics,
+  and the dashboard displays them as such (confidence and risk captions
+  say so on screen).
+* The dashboard is a development/demo surface — authentication, multi-user
+  access and deployment are explicitly out of scope for this phase.
+
 ## Installation
 
 Requires Python 3.
@@ -549,9 +635,11 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Dependencies: `GitPython` and `pytest` (nothing else). The code analyzer,
-intent extractor, drift detector and risk scorer use only the Python
-standard library. Python 3.9+ is required (`ast.unparse`).
+Dependencies: `GitPython` and `streamlit` (runtime) plus `pytest` (tests).
+The analysis stages — code analyzer, intent extractor, drift detector and
+risk scorer — use only the Python standard library; Streamlit is required
+solely by the dashboard and is imported lazily, so everything else works
+without it. Python 3.9+ is required (`ast.unparse`).
 
 ## Running the tests
 
@@ -559,7 +647,7 @@ standard library. Python 3.9+ is required (`ast.unparse`).
 pytest
 ```
 
-The suite covers all five stages:
+The suite covers all six stages:
 
 * **Git History Analyzer** — repository validation, error handling, branch
   detection (including detached HEAD), commit messages/hashes, changed files
@@ -591,7 +679,16 @@ The suite covers all five stages:
   (preserved scoring 0/LOW, authentication ≥ MEDIUM, payment highest at
   HIGH/CRITICAL, C strictly above B).
 
-All five suites include an integration test against the PayGuard test
+* **Dashboard** — the pure pipeline builder across all five analysis
+  stages (deterministic output, JSON serialization, commit/file/intent
+  shapes, cross-stage drift↔risk consistency), captured error models for
+  missing/non-git/empty repositories, severity icons, tab order, the
+  non-Streamlit usage hint — plus Streamlit `AppTest` UI tests that run
+  the real `dashboard.py` script in-process (preselected repository,
+  intro state, error state, Analyze-button interaction and the risk
+  findings view), skipped automatically when Streamlit is unavailable.
+
+All six suites include an integration test against the PayGuard test
 repository (automatically skipped if PayGuard is not present).
 
 ## Usage examples
@@ -729,6 +826,24 @@ print(summary["total_findings"], summary["overall_risk"])
 data = report.findings[0].to_dict()
 ```
 
+### Dashboard
+
+```bash
+streamlit run dashboard.py                          # opens the web UI
+GHOSTCODE_REPOSITORY=~/Projects/PayGuard streamlit run dashboard.py
+```
+
+```python
+# The same view model, without any UI runtime:
+from ghostcode.dashboard import build_dashboard_model
+
+model = build_dashboard_model("/Users/you/Projects/PayGuard")
+assert model.ok, model.error
+print(model.git["branch"], model.git["total_commits"])
+print(len(model.drift["results"]), "comparisons")
+print(model.risk["overall_risk"], "overall risk")
+```
+
 ### Demo script
 
 ```bash
@@ -853,6 +968,7 @@ ghostcode/
 ├── README.md
 ├── requirements.txt
 ├── demo.py                     # small manual demo CLI (git + code + intent + drift + risk)
+├── dashboard.py                # Streamlit entry point: `streamlit run dashboard.py`
 │
 ├── src/
 │   └── ghostcode/
@@ -861,7 +977,8 @@ ghostcode/
 │       ├── code_analyzer.py    # PythonCodeAnalyzer + data models
 │       ├── intent_extractor.py # IntentExtractor + Intent model
 │       ├── drift_detector.py   # IntentDriftDetector + DriftResult model
-│       └── risk_scorer.py      # risk scoring: RiskScore/RiskReport + calculate_risk
+│       ├── risk_scorer.py      # risk scoring: RiskScore/RiskReport + calculate_risk
+│       └── dashboard.py        # view model (build_dashboard_model) + Streamlit view
 │
 └── tests/
     ├── conftest.py
@@ -869,7 +986,8 @@ ghostcode/
     ├── test_code_analyzer.py
     ├── test_intent_extractor.py
     ├── test_drift_detector.py
-    └── test_risk_scorer.py
+    ├── test_risk_scorer.py
+    └── test_dashboard.py
 ```
 
 ## Known limitations
@@ -909,6 +1027,10 @@ ghostcode/
   the original commit's category, scope is read from the drift evidence
   text, evidence strength is judged per rule, and `overall_risk` is the
   worst finding rather than a cumulative measure.
+* The dashboard is a read-only viewer: results live in the session (a
+  refresh re-runs the pipeline), there is no filtering/pagination for very
+  large repositories, and authentication or multi-user access are out of
+  scope for this phase.
 
 ## License
 

@@ -8,14 +8,15 @@ code structure — and then compares that intent against the current Python
 implementation. The goal is to flag places where the code may have drifted
 away from what the developers originally intended.
 
-> ⚠️ **Project status:** GhostCode is a work in progress. **Four pipeline
+> ⚠️ **Project status:** GhostCode is a work in progress. **Five pipeline
 > stages currently exist** — the Git History Analyzer, the Python Code
-> Analyzer, Intent Extraction and Intent Drift Detection. Risk scoring and
-> the dashboard are future work.
+> Analyzer, Intent Extraction, Intent Drift Detection and Risk Scoring.
+> The dashboard is future work.
 >
 > GhostCode extracts structural evidence from Python source code and
-> structured intent from Git history, then compares them: this phase
-> implements deterministic, explainable intent drift detection.
+> structured intent from Git history, then compares them and scores the
+> resulting drift: this phase implements deterministic, explainable risk
+> scoring.
 
 ## Intended pipeline
 
@@ -28,10 +29,10 @@ Python Code Analyzer        ← implemented
       ↓
 Intent Extraction           ← implemented
       ↓
-Intent vs Implementation    ← implemented (this phase)
+Intent vs Implementation    ← implemented
 Comparison + Drift Detection
       ↓
-Risk Scoring                ← not yet implemented
+Risk Scoring                ← implemented (this phase)
       ↓
 Streamlit Dashboard         ← not yet implemented
 ```
@@ -43,8 +44,8 @@ Streamlit Dashboard         ← not yet implemented
 | Git History Analyzer | ✅ implemented |
 | Python Code Analyzer (AST) | ✅ implemented |
 | Intent Extraction | ✅ implemented |
-| Intent vs Implementation Comparison + Drift Detection | ✅ implemented (this phase) |
-| Risk Scoring | ⏳ planned |
+| Intent vs Implementation Comparison + Drift Detection | ✅ implemented |
+| Risk Scoring | ✅ implemented (this phase) |
 | Streamlit Dashboard | ⏳ planned |
 
 ## Purpose of `GitHistoryAnalyzer`
@@ -242,9 +243,9 @@ Evidence:
 `PythonCodeAnalyzer`) across chronological commits and reports places where
 a previously established behavior is no longer represented in later code.
 
-> **Drift detection in this phase is deterministic and heuristic. It does
-> not use an LLM, and it does not score risk — risk scoring is a later
-> phase.**
+> **Drift detection is deterministic and heuristic. It does not use an
+> LLM, and it does not score risk itself — the risk scoring stage that
+> follows scores each drift finding (see “Risk Scoring” below).**
 
 ### How detection works
 
@@ -356,8 +357,186 @@ never consulted) is **HIGH**.
   *failure* branch — only that the sink is reachable.
 * Only the current working tree is analyzed; historical file contents are
   never read, so drift is always measured against today's code.
-* Severity and confidence are deterministic heuristics, not risk — and the
-  detector deliberately does not say *how bad* a drift is (a later phase).
+* Severity and confidence are deterministic heuristics, not risk — the
+  detector does not say *how bad* a drift is; that judgment belongs to the
+  risk scoring stage below.
+
+## Risk Scoring
+
+`risk_scorer` is the fifth pipeline stage: it consumes the
+`DriftResult` rows produced by `IntentDriftDetector` and assigns each one a
+**risk score from 0 to 100** representing the *potential engineering impact*
+of the detected drift, together with a severity, the exact factors that
+produced the score, and a prose explanation.
+
+> **The score is deterministic and explainable — and it is explicitly NOT a
+> probability.** It is a hand-written weighted heuristic with published
+> weights; “87/100” means “weighed factors added up to 87”, never “87%
+> likely to fail”. Nothing in this stage uses an LLM, a model, randomness
+> or a network.
+
+### What the score means
+
+* **0** — no drift (or a preserved/benign change): nothing to act on.
+* **20–49 (MEDIUM)** — a real but contained behavior change.
+* **50–74 (HIGH)** — meaningful loss in an important area, or a broad
+  loss backed by strong evidence.
+* **75–100 (CRITICAL)** — a significant loss in a sensitive area
+  (payment / security), usually with high-confidence, direct AST evidence.
+
+### How scoring works
+
+**1. Baseline from the drift verdict** (highest applicable tier wins):
+
+| Drift verdict | Baseline |
+| --- | --- |
+| no significant drift / preserved / benign (`drift_type = none`) | **0** |
+| weakened or partial drift | **35** |
+| lost drift (not classified `high`) | **60** |
+| significant / high drift (`severity = high`) | **70** |
+
+When the baseline is 0, **no contextual factor is applied at all** — the
+score is exactly 0, so a preserved comparison can never look risky (no
+false positives).
+
+**2. Contextual factors** (only for actual drift), summed on top:
+
+| Factor | Condition | Points |
+| --- | --- | --- |
+| Impact area | cleanup / refactor / general | +0 |
+| | validation | +5 |
+| | authentication | +10 |
+| | logging / audit | +10 |
+| | payment / transaction | +20 |
+| | security / access control | +20 |
+| Scope | single function/file | +0 |
+| | multiple functions | +5 |
+| | multiple files | +10 |
+| Confidence | `≥ 0.90` / `≥ 0.75` / `< 0.75` | +10 / +5 / +0 |
+| Evidence strength | direct AST rule / heuristic rule | +10 / +0 |
+
+* The **impact area** comes from the original intent's category (the
+  domain where the behavior was established), mapped through the explicit
+  `AREA_IMPACT` table — every category has a listed weight, nothing is
+  defaulted silently.
+* **Scope** is read from the drift evidence: two or more shared changed
+  files → `+10`; otherwise two or more cited functions → `+5`.
+* **Direct AST evidence** means the behavior rule inspected concrete
+  structure (`logging-coverage`, `validation-presence`,
+  `prevention-guard`, `file-presence`); the name-matching
+  `generic-presence` rule counts as indirect (`+0`).
+
+**3. Cap** — the raw total is capped at `100` (the pre-cap total is kept
+as `raw_score`).
+
+**4. Severity mapping** — `0–19 → LOW`, `20–49 → MEDIUM`,
+`50–74 → HIGH`, `75–100 → CRITICAL`, plus one explicit **floor rule**: a
+drift whose own severity is `high` in a security/payment-sensitive area is
+**never mapped below `HIGH`**, regardless of how few contextual factors
+applied — a significant loss in those areas cannot become `LOW` just
+because the context is thin. The floor only ever raises a severity, never
+lowers one.
+
+### Risk data model
+
+Every scored finding is a `RiskScore` dataclass, JSON-serializable via
+`to_dict()`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `score` | `int` | Final score in `[0, 100]` (raw total capped) |
+| `severity` | `str` | `LOW` / `MEDIUM` / `HIGH` / `CRITICAL` |
+| `factors` | `list[RiskFactor]` | Every applied factor (`code`, `label`, `points`); their points always sum to `raw_score` |
+| `explanation` | `str` | Prose explanation of why the score was produced |
+| `affected_area` | `str` | Domain the drift affects (e.g. `payment`, `authentication`) |
+| `confidence` | `float` | Confidence of the underlying drift detection |
+| `drift_type` | `str` | `none` / `behavior_weakened` / `behavior_partial` / `behavior_lost` |
+| `source_commit` | `str` | Commit where the original intent was established |
+| `detected_commit` | `str` | Later commit where the drift was detected |
+| `raw_score` | `int` | Factor sum before the cap at 100 |
+
+### API
+
+```python
+from ghostcode.risk_scorer import calculate_risk, calculate_risk_report
+
+score = calculate_risk(drift_result)          # one finding -> RiskScore
+report = calculate_risk_report(drift_report)  # repository -> RiskReport
+```
+
+`calculate_risk_report` returns a `RiskReport` with every drift finding
+scored (preserved comparisons are not findings) and a repository summary:
+
+```python
+report.to_dict()
+# {
+#   "total_findings": 2,
+#   "high_risk_findings": 2,   # HIGH or above
+#   "critical_findings": 1,    # subset of the above
+#   "overall_risk": 100,       # worst finding drives repository risk
+#   "findings": [ ...RiskScore dicts... ],
+# }
+```
+
+`resolve_severity(score, drift_severity, affected_area)` exposes the
+range mapping and the floor rule on their own.
+
+### Example (real output from `python3 demo.py risk ~/Projects/PayGuard`)
+
+```
+RISK SCORE: 100/100
+SEVERITY: CRITICAL
+Original commit: Prevent duplicate payment processing
+Detected commit: Refactor payment processing
+Affected area: payment
+Confidence: 0.95
+
+Factors:
++70 significant/high drift
++20 payment/transaction impact
++10 high confidence
++10 direct AST evidence
+
+Raw total: 110
+Final score: 100
+
+Explanation:
+"A previously established payment behavior is no longer represented in
+later code. The affected area is payment/transaction processing. Drift was
+detected at the later commit 'Refactor payment processing'. The
+prevention-guard rule inspects concrete AST structure (functions, calls
+and state), so the evidence is direct. Weighted factors total 110, capped
+to 100."
+```
+
+On the controlled PayGuard repository the three scenarios separate
+exactly as intended: the preserved email validation scores **0 / LOW** (no
+finding at all), the partially lost failed-login logging scores in the
+**HIGH** band with authentication factors applied, and the lost
+duplicate-payment guard scores the **highest** (capped **100 /
+CRITICAL**) with the payment impact factor — strictly above the
+authentication scenario.
+
+### Risk scoring limitations
+
+* The weights are an explainable prototype heuristic, **not** a
+  calibrated probability, not machine learning, and not empirically
+  validated — they encode a documented engineering judgment.
+* Impact area is derived from the intent category of the original commit,
+  so a misclassified category (or `unknown`) falls back to `general` (+0)
+  and scores lower than a human might expect.
+* Scope is read from the drift evidence (shared files and cited
+  functions); behaviors spanning files beyond the pairing file list are
+  under-counted.
+* Evidence strength is per *rule*, not per line: a direct rule with thin
+  evidence still receives the `+10`, and the heuristic `generic-presence`
+  rule never does.
+* The severity floor fires only for `severity = high` findings in
+  payment/security/access-control areas; it does not intervene anywhere
+  else.
+* `overall_risk` is the worst finding's score — it does not accumulate
+  across many small findings (the finding counts are reported alongside
+  for that context).
 
 ## Installation
 
@@ -371,8 +550,8 @@ pip install -r requirements.txt
 ```
 
 Dependencies: `GitPython` and `pytest` (nothing else). The code analyzer,
-intent extractor and drift detector use only the Python standard library.
-Python 3.9+ is required (`ast.unparse`).
+intent extractor, drift detector and risk scorer use only the Python
+standard library. Python 3.9+ is required (`ast.unparse`).
 
 ## Running the tests
 
@@ -380,7 +559,7 @@ Python 3.9+ is required (`ast.unparse`).
 pytest
 ```
 
-The suite covers all four stages:
+The suite covers all five stages:
 
 * **Git History Analyzer** — repository validation, error handling, branch
   detection (including detached HEAD), commit messages/hashes, changed files
@@ -402,7 +581,17 @@ The suite covers all four stages:
   skipped, chronological pairing regardless of input order, serialization —
   plus the three intentional PayGuard scenarios (preserved / medium / high).
 
-All four suites include an integration test against the PayGuard test
+* **Risk Scoring** — zero/minimal risk for no drift and preserved intents,
+  the documented baseline tiers (0/35/60/70), every impact-area weight
+  (validation +5 … payment/security +20), single vs multi-function vs
+  multi-file scope, confidence and evidence-strength adjustments, the cap
+  at 100 with the preserved raw total, the severity range boundaries and
+  the sensitive-area floor rule, factor-sum invariants, JSON
+  serialization, report rollups — plus the three PayGuard scenarios
+  (preserved scoring 0/LOW, authentication ≥ MEDIUM, payment highest at
+  HIGH/CRITICAL, C strictly above B).
+
+All five suites include an integration test against the PayGuard test
 repository (automatically skipped if PayGuard is not present).
 
 ## Usage examples
@@ -508,6 +697,38 @@ for line in check.evidence:
     print(" -", line)
 ```
 
+### Risk scoring
+
+```python
+from ghostcode.git_analyzer import GitHistoryAnalyzer
+from ghostcode.code_analyzer import PythonCodeAnalyzer
+from ghostcode.drift_detector import IntentDriftDetector
+from ghostcode.risk_scorer import calculate_risk, calculate_risk_report
+
+history = GitHistoryAnalyzer("/Users/you/Projects/PayGuard").analyze()
+code = PythonCodeAnalyzer("/Users/you/Projects/PayGuard").analyze()
+drift = IntentDriftDetector().detect(history.commits, code)
+
+# One finding at a time:
+for finding in calculate_risk_report(drift).findings:
+    print(f"{finding.score:>3}/100 {finding.severity:<8} {finding.affected_area}")
+    for risk_factor in finding.factors:
+        print("   ", risk_factor)          # e.g. "+20 payment/transaction impact"
+    print("   ", finding.explanation)
+
+# Or score a single drift result directly:
+first = drift.results[0]
+print(calculate_risk(first).score, calculate_risk(first).severity)
+
+# Repository-level summary (all findings + overall risk):
+report = calculate_risk_report(drift)
+summary = report.to_dict()
+print(summary["total_findings"], summary["overall_risk"])
+
+# Every model exposes a deterministic plain-dict form:
+data = report.findings[0].to_dict()
+```
+
 ### Demo script
 
 ```bash
@@ -517,6 +738,8 @@ python3 demo.py code ~/Projects/PayGuard -v   # per-file breakdown
 python3 demo.py intent ~/Projects/PayGuard    # extracted developer intents
 python3 demo.py drift ~/Projects/PayGuard     # intent drift report
 python3 demo.py drift ~/Projects/PayGuard -v  # + full evidence & confidence
+python3 demo.py risk ~/Projects/PayGuard      # risk scores for each finding
+python3 demo.py risk ~/Projects/PayGuard -v   # + hashes & full JSON summary
 ```
 
 The git command prints:
@@ -581,6 +804,24 @@ Drift detected: 2
 Significant (medium/high): 2
 ```
 
+The risk command runs the full pipeline (history → code → intent → drift →
+risk) and prints one block per finding — `RISK SCORE: n/100`, the
+severity, the original/detected commit, the affected area, the factor list
+with their exact point contributions, the raw total vs the final score,
+and the prose explanation (a full block is shown in the *Risk Scoring*
+section above) — followed by the repository summary:
+
+```json
+{
+  "total_findings": 2,
+  "high_risk_findings": 2,
+  "critical_findings": 1,
+  "overall_risk": 100
+}
+```
+
+Preserved comparisons produce no risk finding, so they never appear here.
+
 ## PayGuard — the controlled test repository
 
 `~/Projects/PayGuard` is a small local Git repository with seven known
@@ -595,8 +836,14 @@ the three intentional drift scenarios hold — email validation **preserved**
 (no drift), failed-login logging **partially lost** on the token
 authentication path after the authentication refactor (**MEDIUM**), and the
 duplicate-payment guard no longer consulted after the payment refactor
-(**HIGH**) — all through semantic checks, with no hard-coded hashes, line
-numbers, complete output strings or repository-specific rules.
+(**HIGH**) — and that the three risk scenarios hold — the preserved
+validation intent produces **no risk finding (0 / LOW, no false positive)**,
+the lost failed-login logging scores **at least MEDIUM** with the
+authentication impact factor applied, and the lost duplicate-payment guard
+scores the **highest** of the three (**HIGH or CRITICAL**, payment impact
+factor applied, strictly above the authentication scenario) — all through
+semantic checks, with no hard-coded hashes, line numbers, complete output
+strings, expected scores or repository-specific rules.
 
 ## Project structure
 
@@ -605,7 +852,7 @@ ghostcode/
 │
 ├── README.md
 ├── requirements.txt
-├── demo.py                     # small manual demo CLI (git + code + intent + drift)
+├── demo.py                     # small manual demo CLI (git + code + intent + drift + risk)
 │
 ├── src/
 │   └── ghostcode/
@@ -613,14 +860,16 @@ ghostcode/
 │       ├── git_analyzer.py     # GitHistoryAnalyzer + data models
 │       ├── code_analyzer.py    # PythonCodeAnalyzer + data models
 │       ├── intent_extractor.py # IntentExtractor + Intent model
-│       └── drift_detector.py   # IntentDriftDetector + DriftResult model
+│       ├── drift_detector.py   # IntentDriftDetector + DriftResult model
+│       └── risk_scorer.py      # risk scoring: RiskScore/RiskReport + calculate_risk
 │
 └── tests/
     ├── conftest.py
     ├── test_git_analyzer.py
     ├── test_code_analyzer.py
     ├── test_intent_extractor.py
-    └── test_drift_detector.py
+    ├── test_drift_detector.py
+    └── test_risk_scorer.py
 ```
 
 ## Known limitations
@@ -651,9 +900,15 @@ ghostcode/
   that a logging call sits on the failure branch.
 * Drift is always measured against the current working tree; historical file
   contents are never read.
-* Drift severity/confidence are deterministic heuristics, not risk — the
-  detector does not decide how *bad* a drift is (risk scoring is a later
-  phase).
+* Drift severity/confidence are deterministic heuristics — the *magnitude*
+  judgment is made by the risk scoring stage, whose weights are a published
+  heuristic rather than a calibrated probability (see the *Risk Scoring*
+  limitations above).
+* Risk scores inherit every upstream limitation (intent classification,
+  name-based drift checks) and add their own: the impact area comes from
+  the original commit's category, scope is read from the drift evidence
+  text, evidence strength is judged per rule, and `overall_risk` is the
+  worst finding rather than a cumulative measure.
 
 ## License
 

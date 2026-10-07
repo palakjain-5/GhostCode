@@ -9,6 +9,7 @@ Usage::
     python3 demo.py code ~/Projects/PayGuard --verbose
     python3 demo.py intent ~/Projects/PayGuard        # extracted intents
     python3 demo.py drift ~/Projects/PayGuard         # intent drift report
+    python3 demo.py risk ~/Projects/PayGuard          # risk scores for drift
 
 For backward compatibility a bare path is treated as the ``git`` command::
 
@@ -16,12 +17,14 @@ For backward compatibility a bare path is treated as the ``git`` command::
 
 The script is intentionally tiny: all analysis logic lives in
 ``src/ghostcode/git_analyzer.py``, ``src/ghostcode/code_analyzer.py``,
-``src/ghostcode/intent_extractor.py`` and ``src/ghostcode/drift_detector.py``.
+``src/ghostcode/intent_extractor.py``, ``src/ghostcode/drift_detector.py``
+and ``src/ghostcode/risk_scorer.py``.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -37,8 +40,9 @@ from ghostcode.code_analyzer import (  # noqa: E402
 from ghostcode.git_analyzer import GitAnalyzerError, GitHistoryAnalyzer  # noqa: E402
 from ghostcode.intent_extractor import IntentExtractor  # noqa: E402
 from ghostcode.drift_detector import IntentDriftDetector  # noqa: E402
+from ghostcode.risk_scorer import calculate_risk_report  # noqa: E402
 
-COMMANDS = ("git", "code", "intent", "drift")
+COMMANDS = ("git", "code", "intent", "drift", "risk")
 
 
 def _display_path(path: Path, root: Path) -> str:
@@ -237,6 +241,78 @@ def _run_drift(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_risk(args: argparse.Namespace) -> int:
+    try:
+        history = GitHistoryAnalyzer(args.repository).analyze()
+    except GitAnalyzerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        code = PythonCodeAnalyzer(args.repository).analyze()
+    except CodeAnalyzerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    drift = IntentDriftDetector().detect(history.commits, code)
+    risk = calculate_risk_report(drift)
+    rows_by_hash = {r.original_commit_hash: r for r in drift.results}
+
+    print(f"Repository: {drift.repository_name}")
+    print(f"Comparisons: {len(drift.results)}")
+    print(f"Findings: {risk.total_findings}")
+    print(f"High-risk findings: {risk.high_risk_findings}")
+    print(f"Critical findings: {risk.critical_findings}")
+    print(f"Overall risk: {risk.overall_risk}")
+    print()
+
+    for index, finding in enumerate(risk.findings, start=1):
+        row = rows_by_hash.get(finding.source_commit)
+        print("RISK SCORE:", f"{finding.score}/100")
+        print("SEVERITY:", finding.severity)
+        if row is not None:
+            print(
+                "Original commit:",
+                row.original_commit_message.splitlines()[0],
+            )
+            print(
+                "Detected commit:",
+                row.later_commit_message.splitlines()[0],
+            )
+        print(f"Affected area: {finding.affected_area}")
+        print(f"Confidence: {finding.confidence:.2f}")
+        print()
+        print("Factors:")
+        for risk_factor in finding.factors:
+            print(f"{risk_factor}")
+        print()
+        print(f"Raw total: {finding.raw_score}")
+        print(f"Final score: {finding.score}")
+        print()
+        print("Explanation:")
+        print(f'"{finding.explanation}"')
+        if args.verbose:
+            print()
+            print(f"Drift type: {finding.drift_type}")
+            print(f"Source commit: {finding.source_commit}")
+            print(f"Detected commit: {finding.detected_commit}")
+        if index < len(risk.findings):
+            print()
+
+    print()
+    summary = risk.to_dict()
+    print("Repository summary:")
+    if args.verbose:
+        print(json.dumps(summary, indent=2))
+    else:
+        print(
+            json.dumps(
+                {k: v for k, v in summary.items() if k != "findings"},
+                indent=2,
+            )
+        )
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Backward compatibility: `demo.py <path>` still runs the git command.
@@ -244,7 +320,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         argv.insert(0, "git")
 
     parser = argparse.ArgumentParser(
-        description="GhostCode development demos (git history / python code)."
+        description=(
+            "GhostCode development demos "
+            "(git / code / intent / drift / risk)."
+        )
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -308,6 +387,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Show full comparison evidence and confidence per result",
     )
 
+    risk_parser = subparsers.add_parser(
+        "risk",
+        help="Score the engineering-impact risk of detected intent drift.",
+    )
+    risk_parser.add_argument(
+        "repository",
+        nargs="?",
+        default=".",
+        help="Path to a local Git repository (default: current directory)",
+    )
+    risk_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show commit hashes and the full JSON summary with findings",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "code":
         return _run_code(args)
@@ -315,6 +411,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _run_intent(args)
     if args.command == "drift":
         return _run_drift(args)
+    if args.command == "risk":
+        return _run_risk(args)
     return _run_git(args)
 
 

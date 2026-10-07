@@ -9,13 +9,13 @@ implementation. The goal is to flag places where the code may have drifted
 away from what the developers originally intended.
 
 > ⚠️ **Project status:** GhostCode is a work in progress. **Intent drift
-> detection is not implemented yet.** Two pipeline stages currently exist —
-> the Git History Analyzer and the Python Code Analyzer. Intent extraction,
-> the intent-vs-implementation comparison, drift detection, risk scoring and
+> detection is not implemented yet.** Three pipeline stages currently exist —
+> the Git History Analyzer, the Python Code Analyzer and Intent Extraction.
+> The intent-vs-implementation comparison, drift detection, risk scoring and
 > the dashboard are all future work.
 >
 > GhostCode currently extracts structural evidence from Python source code.
-> Intent inference and drift detection are implemented in later phases.
+> Intent extraction in this phase is deterministic and heuristic; drift detection is implemented in a later phase.
 
 ## Intended pipeline
 
@@ -24,9 +24,9 @@ Git Repository
       ↓
 Git History Analyzer        ← implemented
       ↓
-Python Code Analyzer        ← implemented (this phase)
+Python Code Analyzer        ← implemented
       ↓
-Intent Extraction           ← not yet implemented
+Intent Extraction           ← implemented (this phase)
       ↓
 Intent vs Implementation Comparison   ← not yet implemented
       ↓
@@ -42,8 +42,8 @@ Streamlit Dashboard         ← not yet implemented
 | Stage | Status |
 | --- | --- |
 | Git History Analyzer | ✅ implemented |
-| Python Code Analyzer (AST) | ✅ implemented (this phase) |
-| Intent Extraction | ⏳ planned |
+| Python Code Analyzer (AST) | ✅ implemented |
+| Intent Extraction | ✅ implemented (this phase) |
 | Intent vs Implementation Comparison | ⏳ planned |
 | Drift Detection | ⏳ planned |
 | Risk Scoring | ⏳ planned |
@@ -109,6 +109,133 @@ Python source are reported instead of silently hidden.
 > judge correctness, does not infer intent and does not detect drift — those
 > are later pipeline stages.
 
+## Purpose of `IntentExtractor`
+
+`IntentExtractor` turns the commit messages produced by `GitHistoryAnalyzer`
+into structured **intent** records — a reliable, explainable baseline of *what
+the developers said they were doing*, to be compared later against *what the
+code currently does*.
+
+> **Intent extraction in this phase is deterministic and heuristic. It does not use an LLM.**
+
+It uses only controlled vocabularies and plain Python string matching — no
+APIs, no network, no embeddings, no models. The same message always yields
+the same `Intent`.
+
+> **Intent extraction does not determine whether the current implementation satisfies the intent. That comparison is performed by a later drift-detection phase.**
+
+### Intent data model
+
+Every extraction returns an `Intent` dataclass, serializable with
+`to_dict()` (plain, JSON-friendly types):
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `commit_hash` | `str` or `None` | Source commit (`None` for a raw message) |
+| `commit_message` | `str` | The message the intent was extracted from |
+| `action` | `str` or `None` | Normalized verb (e.g. `"prevent"`); `None` when no known verb is found |
+| `object` | `str` | Main thing affected (conservative; falls back to the message itself) |
+| `scope` | `str` or `None` | Where the intent applies (`"for ..."` phrase, otherwise the object) |
+| `category` | `str` | One of the supported categories below |
+| `keywords` | `list[str]` | Domain keywords that justified the category |
+| `confidence` | `float` | Heuristic score in `[0.0, 1.0]` |
+| `evidence` | `list[str]` | Human-readable reasons for every extraction decision |
+
+### Supported categories
+
+A small controlled vocabulary (`ghostcode.intent_extractor.CATEGORIES`), in
+tie-break order — the first listed wins when scores are equal:
+
+`validation`, `authentication`, `authorization`, `logging`, `payment`,
+`security`, `refactoring`, `bug_fix`, `feature`, `data_processing`,
+`testing`, `configuration`, `cleanup`, `unknown`
+
+Nothing outside this list is ever produced.
+
+### How the heuristics work
+
+* **Action** — the first word in the message that normalizes to a known
+  development verb (`add`, `implement`, `create`, `introduce`, `prevent`,
+  `fix`, `remove`, `delete`, `refactor`, `improve`, `update`, `change`,
+  `log`, `validate`, `handle`, `support`, `allow`, `restrict`, `secure`,
+  `clean`, `simplify`). Regular inflections are normalized
+  (`Added → add`, `Adding → add`, `Improved → improve`,
+  `Preventing → prevent`, `Simplified → simplify`), plus the explicit
+  aliases `cleanup → clean` and `bugfix → fix`. If nothing matches, the
+  action is `None` — a verb is never invented.
+* **Category** — each category declares domain keywords or phrases (e.g.
+  `payment → {payment, transaction, settlement, processing}`).
+  Keywords are matched as **whole words** against the lowercased message, so
+  the `log` signal can never fire inside the word `login`. The category with
+  the most matched keywords wins; ties are broken by the fixed order of
+  `CATEGORIES` (fully deterministic, and explained in the evidence). With no
+  match at all the category is `unknown`.
+* **Object** — the message after the action verb (the `up` particle of
+  `clean up` is dropped), cut at an explicit `for <phrase>` and stripped of
+  leading determiners (`the`, `every`, `a`, ...). If nothing can be
+  identified, the commit message itself is used as the object — the
+  extractor stays conservative and never fabricates content.
+* **Scope** — an explicit `for <phrase>` (e.g. `... for user registration`)
+  becomes the scope directly; otherwise a known action makes the object
+  phrase its implicit scope; otherwise there is no scope (`None`).
+* **Evidence** — every decision records *why*: the matched action keyword,
+  each matched category keyword, competing category scores when several
+  categories matched, the object phrase and the scope phrase — or explicit
+  fallback notes such as `no known action verb found`.
+
+### Confidence
+
+`confidence` is a **heuristic score, not a statistical probability**. It is
+a transparent checklist that adds up a fixed weight whenever a signal was
+found:
+
+| Signal found | Weight |
+| --- | --- |
+| a known action verb | 0.30 |
+| a non-`unknown` category | 0.30 |
+| an object distinct from the raw message | 0.25 |
+| a scope phrase | 0.15 |
+
+The total is rounded to two decimals and always lies in `[0.0, 1.0]`. A
+message like `Initial PayGuard application` (category but no verb) scores
+`0.30`; a fully decomposed message scores `1.00`.
+
+### Example output (real output from `python3 demo.py intent`)
+
+```
+Commit:
+Prevent duplicate payment processing
+
+Intent:
+Action: prevent
+Object: duplicate payment processing
+Category: payment
+Scope: duplicate payment processing
+Confidence: 1.00
+
+Evidence:
+- action keyword: prevent
+- category keyword: payment
+- category keyword: processing
+- category scores: payment=2, data_processing=1
+- object phrase: duplicate payment processing
+- scope phrase: duplicate payment processing
+```
+
+### Intent extraction limitations
+
+* It is keyword/verb heuristics, not language understanding: unusual
+  phrasing, typos, unconventional commit styles or non-English messages can
+  yield `unknown` / `None` fields — by design, since nothing is fabricated.
+* Only the subject (first line) of a multi-line commit message is analysed;
+  the body is stored but ignored.
+* The object/scope split is textual, so leading adjectives stay in the
+  object (`duplicate payment processing`) even where a human might omit them.
+* The confidence score measures *how many signals were found*, not whether
+  the intent is correct — and never whether it is satisfied.
+* The category vocabulary is deliberately small; specialised domains may
+  fall into `unknown`.
+
 ## Installation
 
 Requires Python 3.
@@ -120,9 +247,10 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Dependencies for this phase: `GitPython` and `pytest` (nothing else). The
-code analyzer uses only the Python standard library (`ast`). Python 3.9+ is
-required (`ast.unparse`).
+Dependencies: `GitPython` and `pytest` (nothing else). The code analyzer
+uses only the Python standard library (`ast`), and the intent extractor uses
+only the standard library as well. Python 3.9+ is required
+(`ast.unparse`).
 
 ## Running the tests
 
@@ -130,7 +258,7 @@ required (`ast.unparse`).
 pytest
 ```
 
-The suite covers both analyzer stages:
+The suite covers all three stages:
 
 * **Git History Analyzer** — repository validation, error handling, branch
   detection (including detached HEAD), commit messages/hashes, changed files
@@ -140,7 +268,12 @@ The suite covers both analyzer stages:
   repository scanning, ignored directories (venvs/caches), invalid-source
   reporting and serialization.
 
-Both suites include an integration test against the PayGuard test
+* **Intent Extraction** — action normalization (`Added → add`), category
+  detection across the controlled vocabulary, object and scope extraction,
+  deterministic confidence behaviour, evidence generation, serialization,
+  and semantic checks of all seven PayGuard commit messages.
+
+All three suites include an integration test against the PayGuard test
 repository (automatically skipped if PayGuard is not present).
 
 ## Usage examples
@@ -190,12 +323,35 @@ one = PythonCodeAnalyzer("/Users/you/Projects/PayGuard").analyze_file("payments.
 data = analysis.to_dict()
 ```
 
+### Intent extraction
+
+```python
+from ghostcode.git_analyzer import GitHistoryAnalyzer
+from ghostcode.intent_extractor import IntentExtractor, extract_intent
+
+history = GitHistoryAnalyzer("/Users/you/Projects/PayGuard").analyze()
+intents = IntentExtractor().extract_all(history.commits)
+
+for intent in intents:
+    print(intent.action, intent.category, intent.confidence)
+
+# Raw commit messages work too (handy for unit tests):
+intent = extract_intent("Prevent duplicate payment processing")
+print(intent.category)    # payment
+print(intent.confidence)  # 1.0
+print(intent.evidence)    # ['action keyword: prevent', 'category keyword: payment', ...]
+
+# Every model exposes a deterministic plain-dict form:
+data = intent.to_dict()
+```
+
 ### Demo script
 
 ```bash
 python3 demo.py git ~/Projects/PayGuard       # git history summary
 python3 demo.py code ~/Projects/PayGuard      # python code summary
 python3 demo.py code ~/Projects/PayGuard -v   # per-file breakdown
+python3 demo.py intent ~/Projects/PayGuard    # extracted developer intents
 ```
 
 The git command prints:
@@ -243,16 +399,22 @@ method defined in the repository — selected purely from AST structure, with
 no hard-coded names. (The bare path form `python3 demo.py ~/Projects/PayGuard`
 still runs the git summary.)
 
+The intent command prints the structured intent — action, object, category,
+scope, confidence and evidence — for every commit (a full output block is
+shown in the *Example output* section above).
+
 ## PayGuard — the controlled test repository
 
 `~/Projects/PayGuard` is a small local Git repository with seven known
 commits, used as the **controlled, read-only test repository** for GhostCode.
-GhostCode never modifies it: it only reads its history and parses its source.
-The integration tests assert that at least seven commits and their known
-messages are detected, and that Python files, functions and important
-structural calls (e.g. `validate_email`, `_failed_login`, `record`,
-`_settle`) are discovered through AST structure — no hashes, line numbers or
-repository-specific rules are hard-coded.
+GhostCode never modifies it: it only reads its history, parses its source and
+extracts intents from its messages. The integration tests assert that at
+least seven commits and their known messages are detected, that Python files,
+functions and important structural calls (e.g. `validate_email`,
+`_failed_login`, `record`, `_settle`) are discovered through AST structure,
+and that every known commit yields the expected intent action/category — all
+through semantic checks, with no hard-coded hashes, line numbers, complete
+output strings or repository-specific rules.
 
 ## Project structure
 
@@ -261,18 +423,20 @@ ghostcode/
 │
 ├── README.md
 ├── requirements.txt
-├── demo.py                     # small manual demo CLI (git + code)
+├── demo.py                     # small manual demo CLI (git + code + intent)
 │
 ├── src/
 │   └── ghostcode/
 │       ├── __init__.py
 │       ├── git_analyzer.py     # GitHistoryAnalyzer + data models
-│       └── code_analyzer.py    # PythonCodeAnalyzer + data models
+│       ├── code_analyzer.py    # PythonCodeAnalyzer + data models
+│       └── intent_extractor.py # IntentExtractor + Intent model
 │
 └── tests/
     ├── conftest.py
     ├── test_git_analyzer.py
-    └── test_code_analyzer.py
+    ├── test_code_analyzer.py
+    └── test_intent_extractor.py
 ```
 
 ## Known limitations
@@ -289,6 +453,13 @@ ghostcode/
   y if x]`) are not classified as conditionals.
 * `.py` files with syntax errors are recorded in
   `RepositoryCodeAnalysis.errors` instead of failing the whole analysis.
+* Intent extraction recognises a controlled vocabulary of verbs and domain
+  keywords; it cannot understand arbitrary natural language, and messages it
+  does not recognise fall back to category `unknown` / `None` fields rather
+  than guessed answers.
+* Only the subject line of a commit message is analysed.
+* Intent extraction records what commits *say*, not what the code *does*; no
+  comparison between the two happens yet (later phase).
 
 ## License
 

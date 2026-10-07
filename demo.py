@@ -7,13 +7,15 @@ Usage::
     python3 demo.py git ~/Projects/PayGuard --verbose
     python3 demo.py code ~/Projects/PayGuard          # python code summary
     python3 demo.py code ~/Projects/PayGuard --verbose
+    python3 demo.py intent ~/Projects/PayGuard        # extracted intents
 
 For backward compatibility a bare path is treated as the ``git`` command::
 
     python3 demo.py ~/Projects/PayGuard
 
 The script is intentionally tiny: all analysis logic lives in
-``src/ghostcode/git_analyzer.py`` and ``src/ghostcode/code_analyzer.py``.
+``src/ghostcode/git_analyzer.py``, ``src/ghostcode/code_analyzer.py`` and
+``src/ghostcode/intent_extractor.py``.
 """
 
 from __future__ import annotations
@@ -32,8 +34,9 @@ from ghostcode.code_analyzer import (  # noqa: E402
     RepositoryCodeAnalysis,
 )
 from ghostcode.git_analyzer import GitAnalyzerError, GitHistoryAnalyzer  # noqa: E402
+from ghostcode.intent_extractor import IntentExtractor  # noqa: E402
 
-COMMANDS = ("git", "code")
+COMMANDS = ("git", "code", "intent")
 
 
 def _display_path(path: Path, root: Path) -> str:
@@ -145,6 +148,37 @@ def _run_code(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_intent(args: argparse.Namespace) -> int:
+    try:
+        history = GitHistoryAnalyzer(args.repository).analyze()
+    except GitAnalyzerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    intents = IntentExtractor().extract_all(history.commits)
+    print(f"Repository: {history.repository_name}")
+    print(f"Commits: {len(intents)}")
+    print()
+
+    for index, intent in enumerate(intents, start=1):
+        print(f"Commit:")
+        print(intent.commit_message.splitlines()[0])
+        print()
+        print("Intent:")
+        print(f"Action: {intent.action or '-'}")
+        print(f"Object: {intent.object}")
+        print(f"Category: {intent.category}")
+        print(f"Scope: {intent.scope or '-'}")
+        print(f"Confidence: {intent.confidence:.2f}")
+        print()
+        print("Evidence:")
+        for line in intent.evidence:
+            print(f"- {line}")
+        if index < len(intents):
+            print()
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Backward compatibility: `demo.py <path>` still runs the git command.
@@ -188,9 +222,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Show per-file functions, classes and call counts",
     )
 
+    intent_parser = subparsers.add_parser(
+        "intent",
+        help="Extract structured developer intents from the commit history.",
+    )
+    intent_parser.add_argument(
+        "repository",
+        nargs="?",
+        default=".",
+        help="Path to a local Git repository (default: current directory)",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "code":
         return _run_code(args)
+    if args.command == "intent":
+        return _run_intent(args)
     return _run_git(args)
 
 

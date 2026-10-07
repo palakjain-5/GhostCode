@@ -36,6 +36,16 @@ from .git_analyzer import (
     RepositoryHistory,
     RepositoryNotFoundError,
 )
+from .intent_extractor import (
+    ACTION_ALIASES,
+    ACTION_VERBS,
+    CATEGORIES,
+    CATEGORY_SIGNALS,
+    CONFIDENCE_WEIGHTS,
+    Intent,
+    IntentExtractor,
+    extract_intent,
+)
 
 __version__ = "0.1.0"
 
@@ -70,4 +80,13 @@ __all__ = [
     "InvalidPathError",
     "InvalidSourceError",
     "UnreadableFileError",
+    # Intent extraction (phase: completed)
+    "Intent",
+    "IntentExtractor",
+    "extract_intent",
+    "CATEGORIES",
+    "ACTION_VERBS",
+    "ACTION_ALIASES",
+    "CATEGORY_SIGNALS",
+    "CONFIDENCE_WEIGHTS",
 ]

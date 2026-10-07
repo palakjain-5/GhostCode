@@ -8,14 +8,15 @@ Usage::
     python3 demo.py code ~/Projects/PayGuard          # python code summary
     python3 demo.py code ~/Projects/PayGuard --verbose
     python3 demo.py intent ~/Projects/PayGuard        # extracted intents
+    python3 demo.py drift ~/Projects/PayGuard         # intent drift report
 
 For backward compatibility a bare path is treated as the ``git`` command::
 
     python3 demo.py ~/Projects/PayGuard
 
 The script is intentionally tiny: all analysis logic lives in
-``src/ghostcode/git_analyzer.py``, ``src/ghostcode/code_analyzer.py`` and
-``src/ghostcode/intent_extractor.py``.
+``src/ghostcode/git_analyzer.py``, ``src/ghostcode/code_analyzer.py``,
+``src/ghostcode/intent_extractor.py`` and ``src/ghostcode/drift_detector.py``.
 """
 
 from __future__ import annotations
@@ -35,8 +36,9 @@ from ghostcode.code_analyzer import (  # noqa: E402
 )
 from ghostcode.git_analyzer import GitAnalyzerError, GitHistoryAnalyzer  # noqa: E402
 from ghostcode.intent_extractor import IntentExtractor  # noqa: E402
+from ghostcode.drift_detector import IntentDriftDetector  # noqa: E402
 
-COMMANDS = ("git", "code", "intent")
+COMMANDS = ("git", "code", "intent", "drift")
 
 
 def _display_path(path: Path, root: Path) -> str:
@@ -179,6 +181,62 @@ def _run_intent(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_drift(args: argparse.Namespace) -> int:
+    try:
+        history = GitHistoryAnalyzer(args.repository).analyze()
+    except GitAnalyzerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        code = PythonCodeAnalyzer(args.repository).analyze()
+    except CodeAnalyzerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    report = IntentDriftDetector().detect(history.commits, code)
+    print(f"Repository: {report.repository_name}")
+    print(f"Comparisons: {len(report.results)}")
+    print(f"Drift detected: {len(report.drifted)}")
+    print(f"Significant (medium/high): {len(report.significant)}")
+    print()
+
+    for index, result in enumerate(report.results, start=1):
+        if result.is_drift:
+            print("DRIFT DETECTED")
+        else:
+            print("NO SIGNIFICANT DRIFT")
+        print(
+            f"Original commit: "
+            f"{result.original_commit_message.splitlines()[0]}"
+        )
+        print(f"Later commit: {result.later_commit_message.splitlines()[0]}")
+        print()
+        print("Original intent:")
+        print(f"action = {result.original_intent.action}")
+        print(f"category = {result.original_intent.category}")
+        print(f"object = {result.original_intent.object}")
+        print()
+        print("Later implementation:")
+        for line in result.implementation:
+            print(f"- {line}")
+        print()
+        print("Severity:")
+        print(result.severity.upper())
+        print()
+        print("Reason:")
+        print(result.reason)
+        if args.verbose:
+            print()
+            print("Evidence:")
+            for line in result.evidence:
+                print(f"- {line}")
+            print()
+            print(f"Confidence: {result.confidence:.2f}")
+        if index < len(report.results):
+            print()
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Backward compatibility: `demo.py <path>` still runs the git command.
@@ -233,11 +291,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Path to a local Git repository (default: current directory)",
     )
 
+    drift_parser = subparsers.add_parser(
+        "drift",
+        help="Compare intents across commits against the current code.",
+    )
+    drift_parser.add_argument(
+        "repository",
+        nargs="?",
+        default=".",
+        help="Path to a local Git repository (default: current directory)",
+    )
+    drift_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show full comparison evidence and confidence per result",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "code":
         return _run_code(args)
     if args.command == "intent":
         return _run_intent(args)
+    if args.command == "drift":
+        return _run_drift(args)
     return _run_git(args)
 
 

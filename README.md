@@ -8,14 +8,14 @@ code structure — and then compares that intent against the current Python
 implementation. The goal is to flag places where the code may have drifted
 away from what the developers originally intended.
 
-> ⚠️ **Project status:** GhostCode is a work in progress. **Intent drift
-> detection is not implemented yet.** Three pipeline stages currently exist —
-> the Git History Analyzer, the Python Code Analyzer and Intent Extraction.
-> The intent-vs-implementation comparison, drift detection, risk scoring and
-> the dashboard are all future work.
+> ⚠️ **Project status:** GhostCode is a work in progress. **Four pipeline
+> stages currently exist** — the Git History Analyzer, the Python Code
+> Analyzer, Intent Extraction and Intent Drift Detection. Risk scoring and
+> the dashboard are future work.
 >
-> GhostCode currently extracts structural evidence from Python source code.
-> Intent extraction in this phase is deterministic and heuristic; drift detection is implemented in a later phase.
+> GhostCode extracts structural evidence from Python source code and
+> structured intent from Git history, then compares them: this phase
+> implements deterministic, explainable intent drift detection.
 
 ## Intended pipeline
 
@@ -26,11 +26,10 @@ Git History Analyzer        ← implemented
       ↓
 Python Code Analyzer        ← implemented
       ↓
-Intent Extraction           ← implemented (this phase)
+Intent Extraction           ← implemented
       ↓
-Intent vs Implementation Comparison   ← not yet implemented
-      ↓
-Drift Detection             ← not yet implemented
+Intent vs Implementation    ← implemented (this phase)
+Comparison + Drift Detection
       ↓
 Risk Scoring                ← not yet implemented
       ↓
@@ -43,9 +42,8 @@ Streamlit Dashboard         ← not yet implemented
 | --- | --- |
 | Git History Analyzer | ✅ implemented |
 | Python Code Analyzer (AST) | ✅ implemented |
-| Intent Extraction | ✅ implemented (this phase) |
-| Intent vs Implementation Comparison | ⏳ planned |
-| Drift Detection | ⏳ planned |
+| Intent Extraction | ✅ implemented |
+| Intent vs Implementation Comparison + Drift Detection | ✅ implemented (this phase) |
 | Risk Scoring | ⏳ planned |
 | Streamlit Dashboard | ⏳ planned |
 
@@ -94,7 +92,7 @@ Per Python file (`PythonFileAnalysis`):
 | Classes | name, line range, base classes, decorators, methods |
 | Imports | `import` / `from ... import ...` (including relative imports and aliases) |
 | Function calls | bare name (`_settle`), qualified name (`self._settle`), source line |
-| Conditionals | `if`, `elif`, ternary expressions |
+| Conditionals | `if`, `elif`, ternary expressions (line, kind and the unparsed condition text) |
 | Loops | `for` (incl. `async for`), `while` |
 | Returns | line and the unparsed return expression |
 | Exceptions | `raise` (type + literal message) and `except` handlers (type) |
@@ -106,8 +104,8 @@ function calls — plus a structured `errors` list so files with invalid
 Python source are reported instead of silently hidden.
 
 > The analyzer only answers *"what is structurally present?"*. It does not
-> judge correctness, does not infer intent and does not detect drift — those
-> are later pipeline stages.
+> judge correctness and does not infer intent — the intent-vs-implementation
+> comparison and drift detection are performed by the drift-detection stage.
 
 ## Purpose of `IntentExtractor`
 
@@ -122,7 +120,7 @@ It uses only controlled vocabularies and plain Python string matching — no
 APIs, no network, no embeddings, no models. The same message always yields
 the same `Intent`.
 
-> **Intent extraction does not determine whether the current implementation satisfies the intent. That comparison is performed by a later drift-detection phase.**
+> **Intent extraction does not determine whether the current implementation satisfies the intent. That comparison is performed by `IntentDriftDetector` (see below).**
 
 ### Intent data model
 
@@ -236,6 +234,131 @@ Evidence:
 * The category vocabulary is deliberately small; specialised domains may
   fall into `unknown`.
 
+## Purpose of `IntentDriftDetector`
+
+`IntentDriftDetector` is the drift-detection stage: it compares the
+*historical intent* (from `GitHistoryAnalyzer` commits +
+`IntentExtractor`) against the *current code structure* (from
+`PythonCodeAnalyzer`) across chronological commits and reports places where
+a previously established behavior is no longer represented in later code.
+
+> **Drift detection in this phase is deterministic and heuristic. It does
+> not use an LLM, and it does not score risk — risk scoring is a later
+> phase.**
+
+### How detection works
+
+1. **Chronology** — commits are sorted by `committed_at` (input order is
+   irrelevant), and an `Intent` is extracted for each one.
+2. **Confidence gate** — original intents with confidence below
+   `0.5` (`DEFAULT_MIN_INTENT_CONFIDENCE`) never anchor a drift claim; they
+   are skipped with a documented threshold instead of guessed at.
+3. **Pairing** — for every confident original, the *nearest later related
+   commit* is found: related means a **shared changed file** or a **shared
+   non-`unknown` category**. Unrelated commits are never paired.
+4. **Behavior check** — the original intent is checked against the current
+   code with a rule chosen from its action/category (table below). The
+   check returns `present` / `weakened` / `partial` / `absent`.
+5. **Verdict** — related pairs always produce a comparison row (including
+   `severity = "none"` for preserved intents). Confident intents with *no*
+   related later commit are still checked against the current state as a
+   safety net — but they only produce a row when something was actually
+   lost.
+
+### Behavior rules
+
+| Rule | Chosen when | What must be in the current code |
+| --- | --- | --- |
+| `logging-coverage` | `action == log` or category `logging` | Every sibling flow (name-stem families like `authenticate_*`, falling back to category-related branched functions) can still reach a logging sink (`record`, `audit`, ...) within 4 call hops |
+| `validation-presence` | `action == validate` or category `validation` | The intent's marker function (e.g. `validate_email`) exists **and** is called somewhere |
+| `prevention-guard` | `action == prevent` or `restrict` | A guard matching the *distinctive* object marker (`duplicate`) — as a function, call or condition — or tracked domain state that is written **and** consulted. State that is written but never read means the protection is unenforced |
+| `generic-presence` | everything else | Functions matching the intent object (or, failing that, its category) still exist and are wired up |
+
+Structural evidence comes exclusively from the AST analyzer's current
+output — function names, call names, call-graph reachability and conditional
+expressions. Established files come from the original commit's
+`changed_files`.
+
+### Drift types and severity
+
+| Status | Drift type | Severity | Meaning |
+| --- | --- | --- | --- |
+| `present` | `none` | `none` | Behavior still represented — no significant drift |
+| `weakened` | `behavior_weakened` | `low` | Present but no longer connected to the paths that use it |
+| `partial` | `behavior_partial` | `medium` | Some flows still have it, others lost it |
+| `absent` | `behavior_lost` | `high` | No longer represented in later code |
+
+`DriftResult.confidence` is a **heuristic score, not a probability**: the
+original intent's confidence scaled by an evidence-strength factor
+(1.00 for a full loss, 0.90 for partial/preserved, 0.85 for weakened) and
+capped at `0.95` — the detector never claims certainty.
+
+### Drift result data model
+
+Every comparison returns a `DriftResult` (all fields serializable via
+`to_dict()`):
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `original_commit_hash` / `original_commit_message` | `str` | Commit where the original intent was established |
+| `later_commit_hash` / `later_commit_message` | `str` | Later commit the drift is anchored to |
+| `original_intent` / `later_intent` | `Intent` | The two intents being compared (action, category, object, ...) |
+| `drift_type` | `str` | One of `DRIFT_TYPES` (`none`, `behavior_weakened`, `behavior_partial`, `behavior_lost`) |
+| `severity` | `str` | One of `SEVERITIES` (`none`, `low`, `medium`, `high`) |
+| `reason` | `str` | One-sentence human explanation |
+| `evidence` | `list[str]` | Comparison evidence: pairing basis, both intents, category/action continuity, rule used |
+| `implementation` | `list[str]` | Structural evidence about the current code (per-function coverage, guard presence) |
+| `confidence` | `float` | Heuristic score in `[0.0, 1.0]` |
+
+`DriftReport` wraps all rows for a repository and exposes `.drifted`
+(any severity above `none`) and `.significant` (`medium`/`high`).
+
+### Example output (real output from `python3 demo.py drift`)
+
+```
+DRIFT DETECTED
+Original commit: Log every failed login attempt
+Later commit: Improve authentication flow
+
+Original intent:
+action = log
+category = authentication
+object = failed login attempt
+
+Later implementation:
+- rule: logging coverage over 2 function(s) [sibling name-stem family]
+- authenticate_password -> logging present (reaches 'record')
+- authenticate_token -> logging absent
+
+Severity:
+MEDIUM
+
+Reason:
+A previously established authentication behavior was partially lost during refactoring.
+```
+
+The three intentional scenarios of the controlled PayGuard test repository
+are all detected: email validation stays **preserved** (no drift), the
+lost logging on the token authentication path is **MEDIUM**, and the
+removed duplicate-payment guard (`processed_transaction_ids` written but
+never consulted) is **HIGH**.
+
+### Intent drift detection limitations
+
+* Pairing requires a shared changed file or a shared non-`unknown`
+  category; an unrelated-looking refactor that silently breaks something
+  is only caught by the safety-net check against the current state.
+* Coverage/guard checks are name-based: renaming a behavior function
+  beyond all intent markers can look like a loss, and an inline
+  membership guard written without any marker keyword is invisible to the
+  prevention rule.
+* Call-graph reachability does not verify that a logging call sits on the
+  *failure* branch — only that the sink is reachable.
+* Only the current working tree is analyzed; historical file contents are
+  never read, so drift is always measured against today's code.
+* Severity and confidence are deterministic heuristics, not risk — and the
+  detector deliberately does not say *how bad* a drift is (a later phase).
+
 ## Installation
 
 Requires Python 3.
@@ -247,10 +370,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Dependencies: `GitPython` and `pytest` (nothing else). The code analyzer
-uses only the Python standard library (`ast`), and the intent extractor uses
-only the standard library as well. Python 3.9+ is required
-(`ast.unparse`).
+Dependencies: `GitPython` and `pytest` (nothing else). The code analyzer,
+intent extractor and drift detector use only the Python standard library.
+Python 3.9+ is required (`ast.unparse`).
 
 ## Running the tests
 
@@ -258,22 +380,29 @@ only the standard library as well. Python 3.9+ is required
 pytest
 ```
 
-The suite covers all three stages:
+The suite covers all four stages:
 
 * **Git History Analyzer** — repository validation, error handling, branch
   detection (including detached HEAD), commit messages/hashes, changed files
   and insertion/deletion statistics.
 * **Python Code Analyzer** — function/class/method detection, arguments,
-  calls, returns, conditionals, loops, exceptions, imports, recursive
-  repository scanning, ignored directories (venvs/caches), invalid-source
-  reporting and serialization.
+  calls, returns, conditionals (including their expressions), loops,
+  exceptions, imports, recursive repository scanning, ignored directories
+  (venvs/caches), invalid-source reporting and serialization.
 
 * **Intent Extraction** — action normalization (`Added → add`), category
   detection across the controlled vocabulary, object and scope extraction,
   deterministic confidence behaviour, evidence generation, serialization,
   and semantic checks of all seven PayGuard commit messages.
 
-All three suites include an integration test against the PayGuard test
+* **Intent Drift Detection** — no drift for preserved behavior, partial
+  (medium) drift when a sibling flow loses logging, significant (high) drift
+  when a prevention guard disappears, unrelated commits staying unpaired,
+  multiple independent intents, low-confidence/unknown intents being
+  skipped, chronological pairing regardless of input order, serialization —
+  plus the three intentional PayGuard scenarios (preserved / medium / high).
+
+All four suites include an integration test against the PayGuard test
 repository (automatically skipped if PayGuard is not present).
 
 ## Usage examples
@@ -345,6 +474,40 @@ print(intent.evidence)    # ['action keyword: prevent', 'category keyword: payme
 data = intent.to_dict()
 ```
 
+### Intent drift detection
+
+```python
+from ghostcode.git_analyzer import GitHistoryAnalyzer
+from ghostcode.code_analyzer import PythonCodeAnalyzer
+from ghostcode.drift_detector import IntentDriftDetector
+
+history = GitHistoryAnalyzer("/Users/you/Projects/PayGuard").analyze()
+code = PythonCodeAnalyzer("/Users/you/Projects/PayGuard").analyze()
+
+report = IntentDriftDetector().detect(history.commits, code)
+
+print(len(report.results), "comparisons")
+print(len(report.significant), "significant (medium/high)")
+
+for result in report.significant:
+    print(result.severity.upper(), result.original_intent.category)
+    print("  from:", result.original_commit_message.splitlines()[0])
+    print("  to:  ", result.later_commit_message.splitlines()[0])
+    print("  why: ", result.reason)
+    for line in result.implementation:
+        print("   ", line)
+
+# A single intent can be checked against the current code directly:
+from ghostcode.intent_extractor import extract_intent
+
+commit = history.commits[1]
+intent = extract_intent(commit.message, commit_hash=commit.hash)
+check = IntentDriftDetector().check_behavior(intent, commit, code)
+print(check.status, check.rule)
+for line in check.evidence:
+    print(" -", line)
+```
+
 ### Demo script
 
 ```bash
@@ -352,6 +515,8 @@ python3 demo.py git ~/Projects/PayGuard       # git history summary
 python3 demo.py code ~/Projects/PayGuard      # python code summary
 python3 demo.py code ~/Projects/PayGuard -v   # per-file breakdown
 python3 demo.py intent ~/Projects/PayGuard    # extracted developer intents
+python3 demo.py drift ~/Projects/PayGuard     # intent drift report
+python3 demo.py drift ~/Projects/PayGuard -v  # + full evidence & confidence
 ```
 
 The git command prints:
@@ -403,6 +568,19 @@ The intent command prints the structured intent — action, object, category,
 scope, confidence and evidence — for every commit (a full output block is
 shown in the *Example output* section above).
 
+The drift command prints one comparison block per pair: a `DRIFT DETECTED`
+header (or `NO SIGNIFICANT DRIFT` for preserved intents), the original and
+later commit, the original intent, the later implementation's structural
+evidence, the severity and a one-sentence reason (see the *Example output*
+section of `IntentDriftDetector` above), followed by a summary:
+
+```
+Repository: PayGuard
+Comparisons: 3
+Drift detected: 2
+Significant (medium/high): 2
+```
+
 ## PayGuard — the controlled test repository
 
 `~/Projects/PayGuard` is a small local Git repository with seven known
@@ -412,9 +590,13 @@ extracts intents from its messages. The integration tests assert that at
 least seven commits and their known messages are detected, that Python files,
 functions and important structural calls (e.g. `validate_email`,
 `_failed_login`, `record`, `_settle`) are discovered through AST structure,
-and that every known commit yields the expected intent action/category — all
-through semantic checks, with no hard-coded hashes, line numbers, complete
-output strings or repository-specific rules.
+that every known commit yields the expected intent action/category, and that
+the three intentional drift scenarios hold — email validation **preserved**
+(no drift), failed-login logging **partially lost** on the token
+authentication path after the authentication refactor (**MEDIUM**), and the
+duplicate-payment guard no longer consulted after the payment refactor
+(**HIGH**) — all through semantic checks, with no hard-coded hashes, line
+numbers, complete output strings or repository-specific rules.
 
 ## Project structure
 
@@ -423,20 +605,22 @@ ghostcode/
 │
 ├── README.md
 ├── requirements.txt
-├── demo.py                     # small manual demo CLI (git + code + intent)
+├── demo.py                     # small manual demo CLI (git + code + intent + drift)
 │
 ├── src/
 │   └── ghostcode/
 │       ├── __init__.py
 │       ├── git_analyzer.py     # GitHistoryAnalyzer + data models
 │       ├── code_analyzer.py    # PythonCodeAnalyzer + data models
-│       └── intent_extractor.py # IntentExtractor + Intent model
+│       ├── intent_extractor.py # IntentExtractor + Intent model
+│       └── drift_detector.py   # IntentDriftDetector + DriftResult model
 │
 └── tests/
     ├── conftest.py
     ├── test_git_analyzer.py
     ├── test_code_analyzer.py
-    └── test_intent_extractor.py
+    ├── test_intent_extractor.py
+    └── test_drift_detector.py
 ```
 
 ## Known limitations
@@ -458,8 +642,18 @@ ghostcode/
   does not recognise fall back to category `unknown` / `None` fields rather
   than guessed answers.
 * Only the subject line of a commit message is analysed.
-* Intent extraction records what commits *say*, not what the code *does*; no
-  comparison between the two happens yet (later phase).
+* Drift detection pairs commits only when they share a changed file or a
+  non-`unknown` category; otherwise it falls back to a safety-net check
+  against the current state (which reports only actual losses).
+* Drift behavior checks are name-based (intent markers matched against
+  function/call names and conditional text): renaming a behavior beyond all
+  markers can resemble a loss, and call-graph reachability does not verify
+  that a logging call sits on the failure branch.
+* Drift is always measured against the current working tree; historical file
+  contents are never read.
+* Drift severity/confidence are deterministic heuristics, not risk — the
+  detector does not decide how *bad* a drift is (risk scoring is a later
+  phase).
 
 ## License
 

@@ -142,6 +142,11 @@ class ConditionalInfo:
     line_number: int
     #: One of ``"if"``, ``"elif"``, ``"ternary"``.
     kind: str
+    #: Unparsed condition expression as written (e.g. ``"user is None"`` or
+    #: ``"payment.transaction_id in self.processed_transaction_ids"``).
+    #: Added for explainable drift evidence; older consumers that only read
+    #: ``line_number``/``kind`` are unaffected.
+    expression: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Plain-dict representation of this model."""
@@ -718,7 +723,11 @@ class PythonCodeAnalyzer:
                     kind = "elif"
                 else:
                     kind = "if"
-                cond = ConditionalInfo(line_number=line, kind=kind)
+                cond = ConditionalInfo(
+                    line_number=line,
+                    kind=kind,
+                    expression=ast.unparse(node.test),
+                )
                 analysis.conditionals.append(cond)
                 info = function_of(node)
                 if info is not None:

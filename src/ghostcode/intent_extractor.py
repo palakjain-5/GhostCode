@@ -19,7 +19,9 @@ Design rules:
   returns clean Intent objects; no GitPython or AST internals involved.
 
 Intent extraction does **not** judge whether any code satisfies the
-intent; that comparison belongs to a later drift-detection phase.
+intent; that comparison belongs to
+:mod:`~ghostcode.drift_detector`, which performs it against the current
+code structure.
 """
 
 from __future__ import annotations

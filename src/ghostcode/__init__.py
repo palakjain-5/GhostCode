@@ -46,6 +46,18 @@ from .intent_extractor import (
     IntentExtractor,
     extract_intent,
 )
+from .drift_detector import (
+    BEHAVIOR_STATUSES,
+    DEFAULT_MAX_CALL_DEPTH,
+    DEFAULT_MIN_INTENT_CONFIDENCE,
+    DRIFT_TYPES,
+    SEVERITIES,
+    SEVERITY_BY_DRIFT_TYPE,
+    BehaviorCheck,
+    DriftReport,
+    DriftResult,
+    IntentDriftDetector,
+)
 
 __version__ = "0.1.0"
 
@@ -89,4 +101,15 @@ __all__ = [
     "ACTION_ALIASES",
     "CATEGORY_SIGNALS",
     "CONFIDENCE_WEIGHTS",
+    # Intent drift detection (phase: completed)
+    "IntentDriftDetector",
+    "DriftReport",
+    "DriftResult",
+    "BehaviorCheck",
+    "DRIFT_TYPES",
+    "SEVERITIES",
+    "SEVERITY_BY_DRIFT_TYPE",
+    "BEHAVIOR_STATUSES",
+    "DEFAULT_MIN_INTENT_CONFIDENCE",
+    "DEFAULT_MAX_CALL_DEPTH",
 ]

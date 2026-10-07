@@ -185,6 +185,24 @@ def test_conditionals_are_detected(tmp_path: Path) -> None:
     assert analysis.functions[1].has_conditions is False
 
 
+def test_conditionals_include_expression(tmp_path: Path) -> None:
+    """Conditionals carry the unparsed condition text (added for drift
+    evidence). Existing line/kind consumers are unaffected."""
+    analysis = _analyze(
+        tmp_path,
+        "def check(user, txn_id, seen):\n"
+        "    if user is None or txn_id in seen:\n"
+        "        return False\n"
+        "    return True\n",
+    )
+    expressions = [c.expression for c in analysis.conditionals]
+    assert expressions == ["user is None or txn_id in seen"]
+    # Round-trips through serialization alongside the original fields.
+    assert analysis.to_dict()["conditionals"][0]["expression"] == (
+        "user is None or txn_id in seen"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 6. Loop detection
 # ---------------------------------------------------------------------------

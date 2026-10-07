@@ -688,8 +688,55 @@ The suite covers all six stages:
   intro state, error state, Analyze-button interaction and the risk
   findings view), skipped automatically when Streamlit is unavailable.
 
-All six suites include an integration test against the PayGuard test
+* **End-to-End Validation** (`tests/test_pipeline_e2e.py`) — the complete
+  chain (Git history → code → intent → drift → risk → dashboard model) on
+  purpose-built repositories with cross-stage linkage checks, dashboard ↔
+  independent-pipeline equivalence, three-run determinism at every stage,
+  and error isolation: invalid paths, non-Git directories, repositories
+  without commits or without Python files, malformed and unreadable
+  sources, and low-confidence intents — none may crash an unrelated stage.
+  Covers no-drift, significant-drift and multiple-findings scenarios, the
+  dashboard's success and error states, and PayGuard's documented
+  end-to-end numbers (see the validation workflow below).
+
+All seven suites include an integration test against the PayGuard test
 repository (automatically skipped if PayGuard is not present).
+
+### Validation workflow
+
+To validate the complete system as an integrated application:
+
+```bash
+# 1. Full regression suite (all seven suites)
+pytest -q
+
+# 2. End-to-end validation only (pipeline, PayGuard, dashboard states)
+pytest tests/test_pipeline_e2e.py -q
+
+# 3. Demo workflow, stage by stage, against the controlled PayGuard repo
+python3 demo.py git ~/Projects/PayGuard      # Git history analyzer
+python3 demo.py code ~/Projects/PayGuard     # Python code analyzer
+python3 demo.py intent ~/Projects/PayGuard   # intent extraction
+python3 demo.py drift ~/Projects/PayGuard    # drift detection
+python3 demo.py risk ~/Projects/PayGuard     # risk scoring
+GHOSTCODE_REPOSITORY=~/Projects/PayGuard streamlit run dashboard.py
+```
+
+Expected PayGuard end-to-end results (asserted by the E2E suite):
+
+| Check | Expected |
+| --- | --- |
+| Commits | 7 |
+| Extracted intents | 7 (one per commit) |
+| Drift comparisons | 3 (2 with drift, both significant) |
+| Risk findings | 2 (both HIGH or above, 1 CRITICAL) |
+| Overall risk | 100 |
+| Scenario A — preserved email validation | 0 / LOW, no finding in the report |
+| Scenario B — lost failed-login logging | 70 / HIGH |
+| Scenario C — lost duplicate-payment guard | 100 / CRITICAL (capped from a raw total ≥ 100) |
+
+PayGuard checks are skipped automatically when that repository is absent;
+dashboard UI checks are skipped when Streamlit is not installed.
 
 ## Usage examples
 
